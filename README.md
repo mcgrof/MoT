@@ -33,9 +33,8 @@ python eval.py mot --default-config-path configs/eval_toy.json
 ```
 
 ## Case Study - Multi Agent Reasoning (StrategyQA Memory)
-```cmd
+```console
 python exp/multi_agents_qa.py <algorithm> --checkpoint-dir-path <checkpoint_dir> --cache-mode <retain|free> --agent-count <N> --max-turns <T> --max-examples <M>
-
 python exp/multi_agents_qa.py mot --checkpoint-dir-path outputs/mot_... --cache-mode retain --agent-count 4 --max-turns 7 --max-examples 30
 ```
 
