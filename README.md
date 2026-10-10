@@ -1,6 +1,6 @@
 # KV Cache Translation across Heterogeneous Large Language Models
 
-[![arXiv](https://img.shields.io/badge/arXiv-2607.28979-b31b1b.svg)](https://arxiv.org/abs/2607.28979)
+[![arXiv](https://img.shields.io/badge/arXiv-2607.28979-b31b1b.svg)](https://arxiv.org/abs/2607.28979) [![License: PolyForm Noncommercial](https://img.shields.io/badge/License-PolyForm%20Noncommercial%201.0.0-blue.svg)](LICENSE)
 
 ## 🔔 News
 
@@ -37,6 +37,14 @@ python eval.py mot --default-config-path configs/eval_toy.json
 python exp/multi_agents_qa.py <algorithm> --checkpoint-dir-path <checkpoint_dir> --cache-mode <retain|free> --agent-count <N> --max-turns <T> --max-examples <M>
 python exp/multi_agents_qa.py mot --checkpoint-dir-path outputs/mot_... --cache-mode retain --agent-count 4 --max-turns 7 --max-examples 30
 ```
+
+## 📜 License
+
+This repository is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE).
+
+Use, modification, and redistribution are permitted for **noncommercial purposes only**, including academic research and education.
+
+**Commercial use of this software is not permitted.**
 
 ## 📝 Citation
 
