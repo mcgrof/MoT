@@ -4,7 +4,7 @@
 
 ## 🔔 News
 
-- [2026-10-10] Released `v1.0.0-iclr` for our ICLR submission.
+- [2026-10-10] Released [v1.0.0-iclr](https://github.com/prosopher/MoT/releases/tag/v1.0.0-iclr) for our ICLR submission.
 - [2026-10-04] Accepted to NeurIPS 2026 [AgenticOS](https://agentic-fmos.github.io/)
   - **Mixture-of-Translators: Scalable Memory Reuse across Heterogeneous LLM Agents**
 
