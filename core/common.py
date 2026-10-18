@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import math
+import os
 import random
 import string
 import threading
@@ -326,6 +328,7 @@ class OpenWebTextSequenceStream(IterableDataset):
         shuffle: bool = True,
         shuffle_buffer: int = 10_000,
         seed: int = 42,
+        frozen_partition: Optional[str] = None,
     ) -> None:
         super().__init__()
         self.tokenizer = tokenizer
@@ -334,8 +337,46 @@ class OpenWebTextSequenceStream(IterableDataset):
         self.shuffle = shuffle
         self.shuffle_buffer = shuffle_buffer
         self.seed = seed
+        self.frozen_partition = frozen_partition
+
+    def _iter_frozen_manifest(self, manifest_path: Path) -> Iterable[torch.Tensor]:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("schema") != "knlp_mot_diagnostic_data_v1":
+            raise RuntimeError("Frozen MoT data manifest schema mismatch")
+        if not self.frozen_partition:
+            raise RuntimeError("A frozen MoT manifest requires an explicit partition")
+        partition = manifest.get("partitions", {}).get(self.frozen_partition)
+        if not isinstance(partition, dict):
+            raise RuntimeError(f"Frozen MoT partition is missing: {self.frozen_partition}")
+        tokenizer_payload = json.dumps(
+            {
+                "vocab": self.tokenizer.get_vocab(),
+                "special_tokens_map": self.tokenizer.special_tokens_map,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if hashlib.sha256(tokenizer_payload).hexdigest() != manifest.get("tokenizer_sha256"):
+            raise RuntimeError("Frozen MoT tokenizer fingerprint mismatch")
+        rows = partition.get("rows", [])
+        if int(partition.get("row_count", -1)) != len(rows):
+            raise RuntimeError(f"Frozen MoT row count mismatch: {self.frozen_partition}")
+        for expected_index, row in enumerate(rows):
+            token_ids = row.get("token_ids")
+            if row.get("row_index") != expected_index:
+                raise RuntimeError(f"Frozen MoT row order mismatch: {self.frozen_partition}")
+            if not isinstance(token_ids, list) or len(token_ids) != self.sequence_length:
+                raise RuntimeError(f"Frozen MoT token length mismatch: {self.frozen_partition}/{expected_index}")
+            encoded = json.dumps(token_ids, separators=(",", ":")).encode("utf-8")
+            if hashlib.sha256(encoded).hexdigest() != row.get("token_ids_sha256"):
+                raise RuntimeError(f"Frozen MoT token hash mismatch: {self.frozen_partition}/{expected_index}")
+            yield torch.tensor(token_ids, dtype=torch.long)
 
     def __iter__(self) -> Iterable[torch.Tensor]:
+        manifest_path = os.environ.get("MOT_FROZEN_DATA_MANIFEST")
+        if manifest_path:
+            yield from self._iter_frozen_manifest(Path(manifest_path).expanduser().resolve())
+            return
         stream = load_dataset("openwebtext", split=self.split, streaming=True)
         if self.shuffle:
             stream = stream.shuffle(seed=self.seed, buffer_size=self.shuffle_buffer)
@@ -387,6 +428,27 @@ def compute_prefix_correction_and_suffix_lm_loss(
     target_layer_indices: Sequence[int],
     prefix_correction_weight: float = 1.0,
 ) -> torch.Tensor:
+    total, _, _ = compute_prefix_correction_and_suffix_lm_loss_components(
+        target_model=target_model,
+        past_key_values=past_key_values,
+        prompt_token_ids=prompt_token_ids,
+        label_token_ids=label_token_ids,
+        native_target_past_key_values=native_target_past_key_values,
+        target_layer_indices=target_layer_indices,
+        prefix_correction_weight=prefix_correction_weight,
+    )
+    return total
+
+
+def compute_prefix_correction_and_suffix_lm_loss_components(
+    target_model: Model,
+    past_key_values: PastKeyValues,
+    prompt_token_ids: TokenIDs,
+    label_token_ids: TokenIDs,
+    native_target_past_key_values: PastKeyValues,
+    target_layer_indices: Sequence[int],
+    prefix_correction_weight: float = 1.0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     correction_start_layer_idx = target_layer_indices[0]
 
     suffix_lm_loss = compute_suffix_lm_loss(
@@ -415,7 +477,12 @@ def compute_prefix_correction_and_suffix_lm_loss(
         F.mse_loss(mixed_key_block, native_key_block, reduction="mean")
         + F.mse_loss(mixed_value_block, native_value_block, reduction="mean")
     )
-    return suffix_lm_loss + (prefix_correction_weight * prefix_correction_loss)
+    weighted_prefix_correction_loss = prefix_correction_weight * prefix_correction_loss
+    return (
+        suffix_lm_loss + weighted_prefix_correction_loss,
+        weighted_prefix_correction_loss,
+        suffix_lm_loss,
+    )
 
 
 

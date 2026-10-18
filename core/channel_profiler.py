@@ -70,6 +70,7 @@ class ChannelProfileResult:
     selected_channels: List[Channel]
     best_validation_loss: float
     history: List[ChannelProfileStep]
+    candidate_scores: List[Dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -80,6 +81,10 @@ class ProxyValidationScore:
 
 def build_channel_profile_config_path(output_dir: Path) -> Path:
     return Path(output_dir) / "channel_profile.json"
+
+
+def build_channel_profile_results_path(output_dir: Path) -> Path:
+    return Path(output_dir) / "channel_profile_results.json"
 
 
 class ChannelProfiler:
@@ -94,6 +99,7 @@ class ChannelProfiler:
         self.tp = ctx.tp
         self.cm = ctx.cm
         self.node_map = build_node_map(ctx.nodes)
+        self.last_results: Dict[str, ChannelProfileResult] = {}
 
     def profile_all_edges(self, edges: Optional[List[Edge]] = None) -> Dict[str, ChannelProfileResult]:
         results: Dict[str, ChannelProfileResult] = {}
@@ -111,6 +117,7 @@ class ChannelProfiler:
                 len(result.selected_channels),
                 result.best_validation_loss,
             )
+        self.last_results = results
         return results
 
     def profile_edge(self, edge: Edge) -> ChannelProfileResult:
@@ -243,6 +250,16 @@ class ChannelProfiler:
             selected_channels=selected_channels,
             best_validation_loss=selected_score.translated_loss,
             history=history,
+            candidate_scores=[
+                {
+                    "candidate_index": idx,
+                    "src_layer_indices": [channel.src_layer_idx for channel in channels],
+                    "tgt_layer_indices": [channel.dst_layer_idx for channel in channels],
+                    "native_validation_loss": score.native_loss,
+                    "translated_validation_loss": score.translated_loss,
+                }
+                for idx, (channels, score) in enumerate(zip(probe_windows, channel_scores))
+            ],
         )
 
     def _profile_terminal_edge(self, edge: Edge) -> ChannelProfileResult:
@@ -267,6 +284,7 @@ class ChannelProfiler:
             selected_channels=selected_channels,
             best_validation_loss=float("nan"),
             history=history,
+            candidate_scores=[],
         )
 
     def _build_terminal_channels(self, edge: Edge) -> List[Channel]:
@@ -520,6 +538,9 @@ class ChannelProfiler:
                 shuffle=True,
                 shuffle_buffer=self.config.shuffle_buffer,
                 seed=self.config.seed + seed_offset,
+                frozen_partition=(
+                    "profile_train" if seed_offset == 0 else "profile_validation"
+                ),
             )
 
             def collate_token_ids(examples: List[torch.Tensor]) -> TokenIDs:
@@ -688,6 +709,7 @@ class ChannelProfiler:
         from alg.mot.train import (
             align_cache_blocks_to_target_tokens,
             build_cross_token_alignment,
+            build_identity_token_alignment,
             replay_target_prefill_with_injected_window,
         )
 
@@ -698,7 +720,12 @@ class ChannelProfiler:
         tgt_spec = self.tp.get_model_spec(edge.tgt_id)
         source_model = self.tp.get_model(edge.src_id)
         target_model = self.tp.get_model(edge.tgt_id)
-        alignment_weights, _, _ = build_cross_token_alignment(
+        alignment_builder = (
+            build_identity_token_alignment
+            if self.config.require_identity_token_ledgers
+            else build_cross_token_alignment
+        )
+        alignment_weights, _, _ = alignment_builder(
             source_model=source_model,
             target_model=target_model,
             source_context_token_ids=sample["source_context_token_ids"],
@@ -739,6 +766,7 @@ class ChannelProfiler:
         from alg.mot.train import (
             align_cache_blocks_to_target_tokens,
             build_cross_token_alignment,
+            build_identity_token_alignment,
             replay_target_prefill_with_injected_window,
         )
 
@@ -749,7 +777,12 @@ class ChannelProfiler:
         tgt_spec = self.tp.get_model_spec(edge.tgt_id)
         source_model = self.tp.get_model(edge.src_id)
         target_model = self.tp.get_model(edge.tgt_id)
-        alignment_weights, _, _ = build_cross_token_alignment(
+        alignment_builder = (
+            build_identity_token_alignment
+            if self.config.require_identity_token_ledgers
+            else build_cross_token_alignment
+        )
+        alignment_weights, _, _ = alignment_builder(
             source_model=source_model,
             target_model=target_model,
             source_context_token_ids=sample["source_context_token_ids"],
@@ -828,6 +861,17 @@ class ChannelProfiler:
 def save_channel_profile_config(output_dir: Path, profile_config: ChannelProfileConfig) -> Path:
     output_path = build_channel_profile_config_path(Path(output_dir))
     write_json(str(output_path), asdict(profile_config))
+    return output_path
+
+
+def save_channel_profile_results(
+    output_dir: Path, results: Dict[str, ChannelProfileResult]
+) -> Path:
+    output_path = build_channel_profile_results_path(Path(output_dir))
+    write_json(
+        str(output_path),
+        {edge_id: asdict(result) for edge_id, result in results.items()},
+    )
     return output_path
 
 

@@ -27,6 +27,7 @@ def build_training_dataloader(ctx: Context, model: Model) -> InfiniteDataLoader:
         shuffle=True,
         shuffle_buffer=config.shuffle_buffer,
         seed=config.seed,
+        frozen_partition="main_train",
     )
     def collate_token_ids(examples: List[torch.Tensor]) -> TokenIDs:
         return TokenIDs(torch.stack([torch.as_tensor(example) for example in examples], dim=0), model_id=model.id)

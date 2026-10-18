@@ -38,5 +38,6 @@
   "mot_top_k": 1,
   "topk_sparse_attn": 32,
   "num_bottom_full_attn": 12,
+  "require_identity_token_ledgers": false,
   "kv_similarity_token_group_size": 8
 }

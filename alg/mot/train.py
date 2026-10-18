@@ -1,6 +1,8 @@
 from dataclasses import asdict, dataclass
+import json
 import math
 from pathlib import Path
+import time
 from typing import Any, Dict, List, Optional, Tuple, Type
 
 import torch
@@ -32,7 +34,6 @@ MOT_VARIANTS = {"single", "mot"}
 
 
 CHANNEL_ALIGNED_LAYER_ALIGNMENTS = {"terminal", "depth-ratio"}
-
 
 
 def uses_channel_alignment(layer_alignment: str) -> bool:
@@ -74,6 +75,7 @@ class TrainConfig(Config):
     mot_top_k: int
     topk_sparse_attn: int
     num_bottom_full_attn: int
+    require_identity_token_ledgers: bool
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -475,7 +477,6 @@ def translate_layer_window(
     return translated_key, translated_value
 
 
-
 def retokenize_agent_runner_context(
     *,
     source_model: Model,
@@ -662,6 +663,8 @@ def token_ledgers_have_identity_alignment(
         return False
     if source_model.id == target_model.id:
         return True
+    if tokenizers_have_equivalent_id_space(source_model, target_model):
+        return True
 
     for source_ids, target_ids in zip(source_rows.tolist(), target_rows.tolist()):
         source_text = _decode_token_ids(source_model.tokenizer, source_ids)
@@ -681,6 +684,56 @@ def token_ledgers_have_identity_alignment(
         if source_spans != target_spans:
             return False
     return True
+
+
+def build_identity_token_alignment(
+    source_model: Model,
+    target_model: Model,
+    source_context_token_ids: TokenIDs,
+    target_context_token_ids: TokenIDs,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build an exact identity map, rejecting any nonidentity token ledger.
+
+    The admitted GPT-2 -> GPT-2-medium lane shares one tokenizer grid.  Using
+    the general character-overlap alignment in that lane can mix repeated or
+    partially decoded Unicode spans even when the token IDs are identical.
+    """
+    if not token_ledgers_have_identity_alignment(
+        source_model,
+        target_model,
+        source_context_token_ids,
+        target_context_token_ids,
+    ):
+        raise ValueError(
+            "Identity token-ledger contract failed: source and target token "
+            "IDs, decoded text, and token spans must match exactly."
+        )
+    batch_size, seq_len = source_context_token_ids.shape
+    device = source_context_token_ids.device
+    mapping = torch.arange(seq_len, device=device, dtype=torch.long).expand(batch_size, -1)
+    weights = torch.eye(seq_len, device=device, dtype=torch.float32).expand(batch_size, -1, -1)
+    return weights, mapping, mapping.clone()
+
+
+_TOKENIZER_ID_SPACE_EQUIVALENCE: Dict[Tuple[int, int], bool] = {}
+
+
+def tokenizers_have_equivalent_id_space(source_model: Model, target_model: Model) -> bool:
+    """Return whether token IDs can be transferred without decode/re-encode."""
+    cache_key = (id(source_model.tokenizer), id(target_model.tokenizer))
+    if cache_key not in _TOKENIZER_ID_SPACE_EQUIVALENCE:
+        if not hasattr(source_model.tokenizer, "get_vocab") or not hasattr(
+            target_model.tokenizer, "get_vocab"
+        ):
+            _TOKENIZER_ID_SPACE_EQUIVALENCE[cache_key] = False
+            return False
+        source_vocab = source_model.tokenizer.get_vocab()
+        target_vocab = target_model.tokenizer.get_vocab()
+        _TOKENIZER_ID_SPACE_EQUIVALENCE[cache_key] = (
+            source_vocab == target_vocab
+            and source_model.tokenizer.special_tokens_map == target_model.tokenizer.special_tokens_map
+        )
+    return _TOKENIZER_ID_SPACE_EQUIVALENCE[cache_key]
 
 
 def align_cache_blocks_to_target_tokens(
@@ -770,6 +823,18 @@ def _retokenize_target_context_row_for_source(
     ensure_token_ids_model(target_model, target_context_token_ids)
     if target_context_token_ids.shape[0] != 1:
         raise ValueError("Target-context retokenization expects a single batch row.")
+    if tokenizers_have_equivalent_id_space(source_model, target_model):
+        exact_source_ids = TokenIDs(
+            target_context_token_ids.as_tensor().detach().clone(),
+            model_id=source_model.id,
+        ).to(source_model.device)
+        if token_ledgers_have_identity_alignment(
+            source_model,
+            target_model,
+            exact_source_ids,
+            target_context_token_ids,
+        ):
+            return exact_source_ids
     target_ids = target_context_token_ids.as_tensor()[0].detach().cpu().tolist()
     context_text = _decode_token_ids(target_model.tokenizer, target_ids)
     encoded = source_model.tokenizer(
@@ -1053,6 +1118,16 @@ def build_replayed_target_past_from_target_context(
             target_model=target_model,
             target_context_token_ids=target_row,
         )
+        if ctx.config.require_identity_token_ledgers and not token_ledgers_have_identity_alignment(
+            source_model,
+            target_model,
+            source_row,
+            target_row,
+        ):
+            raise ValueError(
+                "The configured identity-only MoT lane encountered a nonidentity "
+                "source/target token ledger."
+            )
         with torch.no_grad():
             source_past = extract_past_key_values(source_model, source_row)
         mixed_row, translated_row = build_replayed_target_past(
@@ -1125,7 +1200,9 @@ def resolve_channels(ctx: Context) -> None:
         return
 
     profiler = require_channel_profiler(ctx)
-    profiler.profile_all_edges()
+    results = profiler.profile_all_edges()
+    from core.channel_profiler import save_channel_profile_results
+    save_channel_profile_results(Path(config.output_path), results)
 
 
 def extract_layer_window_blocks(
@@ -1229,8 +1306,6 @@ def require_opt_decoder(model: Model):
     return decoder
 
 
-
-
 def _require_rotary_decoder_model(model: Model, *, family_name: str):
     # core.model.Model adds one wrapper around the Hugging Face causal LM.
     # Walk common wrapper attributes instead of assuming a fixed nesting depth.
@@ -1320,7 +1395,6 @@ def build_opt_input_hidden_states(
     else:
         attention_mask = build_causal_attention_mask(hidden_states)
     return hidden_states, token_attention_mask, attention_mask
-
 
 
 def _build_rotary_input_hidden_states(
@@ -1637,7 +1711,6 @@ def build_sparse_query_mask(
     return sparse_attention_indices > query_positions
 
 
-
 def repeat_key_value_heads(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """Expand grouped-query KV heads from [batch, kv_heads, seq, head_dim] to query heads."""
     if n_rep == 1:
@@ -1874,7 +1947,6 @@ def run_opt_block(
     if not getattr(block, "do_layer_norm_before", False):
         hidden_states = block.final_layer_norm(hidden_states)
     return hidden_states, (native_like_key, native_like_value)
-
 
 
 def run_qwen2_block(
@@ -2634,6 +2706,9 @@ def build_translator_pool(
 ) -> TranslatorPool:
     config = ctx.config
     resolve_channels(ctx)
+    # Proxy candidates consume RNG state.  The final diagnostic must start from
+    # a fresh seed-42 initialization independent of profiling order and count.
+    set_seed(config.seed)
     translator_pool = initialize_translators(
         ctx=ctx,
         translator_dim=config.translator_dim,
@@ -2742,6 +2817,46 @@ def run_train(ctx: Context) -> Path:
         total_steps=config.max_steps,
     )
 
+    step_record_path = output_path / "training_steps.jsonl"
+    step_record_handle = step_record_path.open("w", encoding="utf-8", buffering=1)
+    train_start_time = time.monotonic()
+    named_translator_parameters = [
+        (f"{translator_id}.{name}", parameter)
+        for translator_id, translator in translator_pool.translators.items()
+        for name, parameter in translator.named_parameters()
+    ]
+    initial_parameter_versions = {
+        name: int(parameter._version)
+        for name, parameter in named_translator_parameters
+    }
+    update_checkpoints = {1, 50, 100, 250, config.max_steps}
+
+    def optimizer_state_dtypes() -> List[str]:
+        return sorted(
+            {
+                str(value.dtype)
+                for state in optimizer.state.values()
+                for value in state.values()
+                if isinstance(value, torch.Tensor)
+            }
+        )
+
+    def parameter_update_counts() -> Dict[str, int]:
+        changed = [
+            (name, parameter)
+            for name, parameter in named_translator_parameters
+            if int(parameter._version) > initial_parameter_versions[name]
+        ]
+        return {
+            "changed_parameter_tensors": len(changed),
+            "total_parameter_tensors": sum(1 for _ in translator_pool.parameters()),
+            "changed_parameter_elements": sum(
+                parameter.numel() for _, parameter in changed
+            ),
+            "total_parameter_elements": sum(
+                parameter.numel() for parameter in translator_pool.parameters()
+            ),
+        }
 
     running_loss = 0.0
     running_gate_importance_cv2 = 0.0
@@ -2749,76 +2864,154 @@ def run_train(ctx: Context) -> Path:
     running_gate_importance_entropy = 0.0
     progress_bar = tqdm(range(1, config.max_steps + 1), desc="Training")
 
-    for step in progress_bar:
-        optimizer.zero_grad(set_to_none=True)
-        step_loss_value = 0.0
+    try:
+        for step in progress_bar:
+            step_start_time = time.monotonic()
+            optimizer.zero_grad(set_to_none=True)
+            step_loss_value = 0.0
+            step_prefix_correction_value = 0.0
+            step_suffix_lm_value = 0.0
+            executed_lr = float(optimizer.param_groups[0]["lr"])
 
-        for _ in range(config.grad_accum_steps):
-            past_by_node_id, batches_by_node_id = build_step_pasts_and_batches(
-                ctx,
-                training_dataloaders,
-            )
-
-            total_direction_loss = 0.0
-            for edge in edges:
-                target_context_token_ids, prompt_token_ids, label_token_ids = batches_by_node_id[edge.tgt_id]
-                mixed_target_past, _ = build_replayed_target_past_from_target_context(
+            for _ in range(config.grad_accum_steps):
+                past_by_node_id, batches_by_node_id = build_step_pasts_and_batches(
                     ctx,
-                    target_context_token_ids=target_context_token_ids,
-                    source_model=ctx.tp.get_model(edge.src_id),
-                    target_model=ctx.tp.get_model(edge.tgt_id),
-                    src_node_id=edge.src_id,
-                    tgt_node_id=edge.tgt_id,
-                    tgt_spec=ctx.tp.get_model_spec(edge.tgt_id),
+                    training_dataloaders,
                 )
-                direction_loss = compute_prefix_correction_and_suffix_lm_loss(
-                    target_model=ctx.tp.get_model(edge.tgt_id),
-                    past_key_values=mixed_target_past,
-                    prompt_token_ids=prompt_token_ids,
-                    label_token_ids=label_token_ids,
-                    native_target_past_key_values=past_by_node_id[edge.tgt_id],
-                    target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
+
+                total_direction_loss = 0.0
+                for edge in edges:
+                    target_context_token_ids, prompt_token_ids, label_token_ids = (
+                        batches_by_node_id[edge.tgt_id]
+                    )
+                    mixed_target_past, _ = (
+                        build_replayed_target_past_from_target_context(
+                            ctx,
+                            target_context_token_ids=target_context_token_ids,
+                            source_model=ctx.tp.get_model(edge.src_id),
+                            target_model=ctx.tp.get_model(edge.tgt_id),
+                            src_node_id=edge.src_id,
+                            tgt_node_id=edge.tgt_id,
+                            tgt_spec=ctx.tp.get_model_spec(edge.tgt_id),
+                        )
+                    )
+                    (
+                        direction_loss,
+                        prefix_correction_loss,
+                        suffix_lm_loss,
+                    ) = compute_prefix_correction_and_suffix_lm_loss_components(
+                        target_model=ctx.tp.get_model(edge.tgt_id),
+                        past_key_values=mixed_target_past,
+                        prompt_token_ids=prompt_token_ids,
+                        label_token_ids=label_token_ids,
+                        native_target_past_key_values=past_by_node_id[edge.tgt_id],
+                        target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
+                    )
+                    if not all(
+                        bool(torch.isfinite(value).item())
+                        for value in (
+                            direction_loss,
+                            prefix_correction_loss,
+                            suffix_lm_loss,
+                        )
+                    ):
+                        raise FloatingPointError(f"Nonfinite MoT loss at step {step}")
+                    total_direction_loss = total_direction_loss + direction_loss
+                    step_prefix_correction_value += (
+                        float(prefix_correction_loss.detach().item())
+                        / config.grad_accum_steps
+                    )
+                    step_suffix_lm_value += (
+                        float(suffix_lm_loss.detach().item()) / config.grad_accum_steps
+                    )
+
+                loss = total_direction_loss / config.grad_accum_steps
+                loss.backward()
+                step_loss_value += loss.item()
+
+            unclipped_gradient_norm = torch.nn.utils.clip_grad_norm_(
+                translator_pool.parameters(), config.grad_clip_norm
+            )
+            if not bool(torch.isfinite(unclipped_gradient_norm).item()):
+                raise FloatingPointError(f"Nonfinite MoT gradient norm at step {step}")
+            optimizer.step()
+            scheduler.step()
+            running_loss += step_loss_value
+            gate_metrics = collect_mot_balance_metrics(translator_pool)
+            running_gate_importance_cv2 += gate_metrics.get("gate_importance_cv2", 0.0)
+            running_gate_load_cv2 += gate_metrics.get("gate_load_cv2", 0.0)
+            running_gate_importance_entropy += gate_metrics.get(
+                "gate_importance_entropy", 0.0
+            )
+            update_counts = (
+                parameter_update_counts() if step in update_checkpoints else None
+            )
+            record = {
+                "step": step,
+                "total_loss": step_loss_value,
+                "prefix_correction_loss": step_prefix_correction_value,
+                "suffix_lm_loss": step_suffix_lm_value,
+                "executed_lr": executed_lr,
+                "next_lr": float(scheduler.lr),
+                "unclipped_gradient_norm": float(unclipped_gradient_norm.item()),
+                "optimizer_state_dtypes": optimizer_state_dtypes(),
+                "elapsed_seconds": time.monotonic() - train_start_time,
+                "step_seconds": time.monotonic() - step_start_time,
+                "parameter_update_counts": update_counts,
+                "gate_metrics": gate_metrics,
+            }
+            step_record_handle.write(json.dumps(record, sort_keys=True) + "\n")
+            if step in update_checkpoints:
+                checkpoint_path = output_path / "step_checkpoints" / f"step-{step:04d}"
+                save_translator_checkpoints(checkpoint_path, translator_pool)
+            if step % config.log_every == 0:
+                avg_loss = running_loss / config.log_every
+                avg_gate_importance_cv2 = running_gate_importance_cv2 / config.log_every
+                avg_gate_load_cv2 = running_gate_load_cv2 / config.log_every
+                avg_gate_importance_entropy = (
+                    running_gate_importance_entropy / config.log_every
                 )
-                total_direction_loss = total_direction_loss + direction_loss
-
-            loss = total_direction_loss / config.grad_accum_steps
-            loss.backward()
-            step_loss_value += loss.item()
-
-        torch.nn.utils.clip_grad_norm_(translator_pool.parameters(), config.grad_clip_norm)
-        optimizer.step()
-        scheduler.step()
-        running_loss += step_loss_value
-        gate_metrics = collect_mot_balance_metrics(translator_pool)
-        running_gate_importance_cv2 += gate_metrics.get("gate_importance_cv2", 0.0)
-        running_gate_load_cv2 += gate_metrics.get("gate_load_cv2", 0.0)
-        running_gate_importance_entropy += gate_metrics.get("gate_importance_entropy", 0.0)
-        if step % config.log_every == 0:
-            avg_loss = running_loss / config.log_every
-            avg_gate_importance_cv2 = running_gate_importance_cv2 / config.log_every
-            avg_gate_load_cv2 = running_gate_load_cv2 / config.log_every
-            avg_gate_importance_entropy = running_gate_importance_entropy / config.log_every
-            progress_bar.set_postfix(
-                loss=f"{avg_loss:.4f}",
-                gate_load_cv2=f"{avg_gate_load_cv2:.4f}",
-                lr=f"{scheduler.lr:.2e}",
-            )
-            logging.info(
-                "[Step %04d] loss=%.4f | gate_importance_cv2=%.4f | gate_load_cv2=%.4f | gate_importance_entropy=%.4f | lr=%.2e",
-                step,
-                avg_loss,
-                avg_gate_importance_cv2,
-                avg_gate_load_cv2,
-                avg_gate_importance_entropy,
-                scheduler.lr,
-            )
-            running_loss = 0.0
-            running_gate_importance_cv2 = 0.0
-            running_gate_load_cv2 = 0.0
-            running_gate_importance_entropy = 0.0
+                progress_bar.set_postfix(
+                    loss=f"{avg_loss:.4f}",
+                    gate_load_cv2=f"{avg_gate_load_cv2:.4f}",
+                    lr=f"{scheduler.lr:.2e}",
+                )
+                logging.info(
+                    "[Step %04d] loss=%.4f | gate_importance_cv2=%.4f | gate_load_cv2=%.4f | gate_importance_entropy=%.4f | lr=%.2e",
+                    step,
+                    avg_loss,
+                    avg_gate_importance_cv2,
+                    avg_gate_load_cv2,
+                    avg_gate_importance_entropy,
+                    scheduler.lr,
+                )
+                running_loss = 0.0
+                running_gate_importance_cv2 = 0.0
+                running_gate_load_cv2 = 0.0
+                running_gate_importance_entropy = 0.0
+    finally:
+        step_record_handle.close()
 
     final_path = get_train_checkpoint_path(output_path)
     save_translator_checkpoints(output_path, translator_pool)
+    write_json(
+        str(output_path / "training_runtime.json"),
+        {
+            "max_steps": config.max_steps,
+            "gradient_accumulation_steps": config.grad_accum_steps,
+            "microbatch_size": config.batch_size,
+            "effective_batch_size": config.batch_size * config.grad_accum_steps,
+            "configured_prefix_tokens": config.prefix_tokens,
+            "executed_cached_context_tokens": config.prefix_tokens - 1,
+            "suffix_input_tokens": config.total_tokens - config.prefix_tokens,
+            "predicted_label_tokens": config.total_tokens - config.prefix_tokens,
+            "optimizer": type(optimizer).__name__,
+            "optimizer_state_dtypes": optimizer_state_dtypes(),
+            "final_parameter_update_counts": parameter_update_counts(),
+            "elapsed_seconds": time.monotonic() - train_start_time,
+            "step_records": str(step_record_path),
+        },
+    )
     logging.info("[Done] final translator checkpoints saved to %s", final_path)
     logging.info("Saved train log to %s", log_path)
     return final_path
