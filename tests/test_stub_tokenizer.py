@@ -1,5 +1,8 @@
 from pathlib import Path
+import hashlib
+import json
 import sys
+from types import SimpleNamespace
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 STUBS_PATH = REPO_ROOT / "tests" / "stubs"
@@ -7,6 +10,7 @@ if str(STUBS_PATH) not in sys.path:
     sys.path.insert(0, str(STUBS_PATH))
 
 from transformers import AutoConfig, TinyTokenizer
+from core.common import _frozen_data_tokenizer_sha256
 
 
 def test_tiny_tokenizer_supports_truncation_and_max_length() -> None:
@@ -40,6 +44,23 @@ def test_eval_text_preparation_matches_training_special_token_policy() -> None:
     expected = tokenizer("abcd", add_special_tokens=False).input_ids
     assert full["token_ids"].shape[1] == len(expected)
     assert cached["token_ids"].shape[1] == len(expected)
+
+
+def test_frozen_tokenizer_hash_ignores_only_runtime_pad_alias() -> None:
+    vocab = {"café": 0, "<eos>": 1}
+    tokenizer = SimpleNamespace(
+        get_vocab=lambda: vocab,
+        special_tokens_map={"eos_token": "<eos>", "pad_token": "<eos>"},
+        _mot_synthetic_pad_alias=True,
+    )
+    payload = json.dumps(
+        {"vocab": vocab, "special_tokens_map": {"eos_token": "<eos>"}},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    assert _frozen_data_tokenizer_sha256(tokenizer) == hashlib.sha256(payload).hexdigest()
 
 
 def test_checkpoint_chat_template_is_loaded_from_standalone_file(tmp_path, monkeypatch) -> None:

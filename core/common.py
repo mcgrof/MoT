@@ -348,15 +348,7 @@ class OpenWebTextSequenceStream(IterableDataset):
         partition = manifest.get("partitions", {}).get(self.frozen_partition)
         if not isinstance(partition, dict):
             raise RuntimeError(f"Frozen MoT partition is missing: {self.frozen_partition}")
-        tokenizer_payload = json.dumps(
-            {
-                "vocab": self.tokenizer.get_vocab(),
-                "special_tokens_map": self.tokenizer.special_tokens_map,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        if hashlib.sha256(tokenizer_payload).hexdigest() != manifest.get("tokenizer_sha256"):
+        if _frozen_data_tokenizer_sha256(self.tokenizer) != manifest.get("tokenizer_sha256"):
             raise RuntimeError("Frozen MoT tokenizer fingerprint mismatch")
         rows = partition.get("rows", [])
         if int(partition.get("row_count", -1)) != len(rows):
@@ -671,11 +663,30 @@ def _attach_checkpoint_chat_template(tokenizer: PreTrainedTokenizerBase, model_i
 
 
 def _finalize_tokenizer(tokenizer: PreTrainedTokenizerBase, model_id: str) -> PreTrainedTokenizerBase:
-    if tokenizer.pad_token is None:
+    synthetic_pad_alias = tokenizer.pad_token is None
+    if synthetic_pad_alias:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer._mot_synthetic_pad_alias = synthetic_pad_alias
     tokenizer.padding_side = "right"
     _attach_checkpoint_chat_template(tokenizer, model_id)
     return tokenizer
+
+
+def _frozen_data_tokenizer_sha256(tokenizer: PreTrainedTokenizerBase) -> str:
+    """Hash the immutable tokenizer identity used when frozen rows were built."""
+    special_tokens_map = dict(tokenizer.special_tokens_map)
+    if bool(getattr(tokenizer, "_mot_synthetic_pad_alias", False)):
+        special_tokens_map.pop("pad_token", None)
+    payload = json.dumps(
+        {
+            "vocab": tokenizer.get_vocab(),
+            "special_tokens_map": special_tokens_map,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def load_tokenizer(model_id: str) -> PreTrainedTokenizerBase:
