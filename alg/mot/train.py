@@ -647,6 +647,42 @@ def build_cross_token_alignment(
     )
 
 
+def token_ledgers_have_identity_alignment(
+    source_model: Model,
+    target_model: Model,
+    source_context_token_ids: TokenIDs,
+    target_context_token_ids: TokenIDs,
+) -> bool:
+    """Return true only when two token ledgers have the same token grid."""
+    if source_context_token_ids.shape != target_context_token_ids.shape:
+        return False
+    source_rows = source_context_token_ids.as_tensor().detach().cpu()
+    target_rows = target_context_token_ids.as_tensor().detach().cpu()
+    if not torch.equal(source_rows, target_rows):
+        return False
+    if source_model.id == target_model.id:
+        return True
+
+    for source_ids, target_ids in zip(source_rows.tolist(), target_rows.tolist()):
+        source_text = _decode_token_ids(source_model.tokenizer, source_ids)
+        target_text = _decode_token_ids(target_model.tokenizer, target_ids)
+        if source_text != target_text:
+            return False
+        source_spans = _token_spans_for_ids(
+            source_model.tokenizer,
+            source_ids,
+            source_text,
+        )
+        target_spans = _token_spans_for_ids(
+            target_model.tokenizer,
+            target_ids,
+            target_text,
+        )
+        if source_spans != target_spans:
+            return False
+    return True
+
+
 def align_cache_blocks_to_target_tokens(
     key_block: torch.Tensor,
     value_block: torch.Tensor,
@@ -851,13 +887,11 @@ def build_replayed_target_past(
         source_model_id=node_model_ids.get(src_node_id),
         top_k=ctx.config.topk_sparse_attn,
     )
-    needs_token_alignment = (
-        source_model.id != target_model.id
-        or source_context_token_ids.shape != target_context_token_ids.shape
-        or not torch.equal(
-            source_context_token_ids.as_tensor().detach().cpu(),
-            target_context_token_ids.as_tensor().detach().cpu(),
-        )
+    needs_token_alignment = not token_ledgers_have_identity_alignment(
+        source_model,
+        target_model,
+        source_context_token_ids,
+        target_context_token_ids,
     )
     alignment_weights = None
     full_alignment_weights = None
@@ -871,24 +905,41 @@ def build_replayed_target_past(
         retain_source_full_context_token_ids is not None
         and retain_target_full_context_token_ids is not None
     ):
-        (
-            full_alignment_weights,
-            full_target_to_source,
-            full_source_to_target,
-        ) = build_cross_token_alignment(
-            source_model=source_model,
-            target_model=target_model,
-            source_context_token_ids=retain_source_full_context_token_ids,
-            target_context_token_ids=retain_target_full_context_token_ids,
+        full_needs_token_alignment = not token_ledgers_have_identity_alignment(
+            source_model,
+            target_model,
+            retain_source_full_context_token_ids,
+            retain_target_full_context_token_ids,
         )
-        sparse_attention_indices = [
-            align_sparse_attention_indices_to_target_tokens(
-                sparse_indices,
-                target_to_source=full_target_to_source,
-                source_to_target=full_source_to_target,
-            )[:, :, retain_prefix_tokens:, :]
-            for sparse_indices in sparse_attention_indices
-        ]
+        if full_needs_token_alignment:
+            (
+                full_alignment_weights,
+                full_target_to_source,
+                full_source_to_target,
+            ) = build_cross_token_alignment(
+                source_model=source_model,
+                target_model=target_model,
+                source_context_token_ids=retain_source_full_context_token_ids,
+                target_context_token_ids=retain_target_full_context_token_ids,
+            )
+            sparse_attention_indices = [
+                align_sparse_attention_indices_to_target_tokens(
+                    sparse_indices,
+                    target_to_source=full_target_to_source,
+                    source_to_target=full_source_to_target,
+                )[:, :, retain_prefix_tokens:, :]
+                for sparse_indices in sparse_attention_indices
+            ]
+        else:
+            if source_prefix_tokens != retain_prefix_tokens:
+                raise ValueError(
+                    "Identity-aligned retained ledgers require equal source and "
+                    "target prefix lengths."
+                )
+            sparse_attention_indices = [
+                sparse_idx[:, :, retain_prefix_tokens:, :]
+                for sparse_idx in sparse_attention_indices
+            ]
     else:
         if retain_source_full_context_token_ids is not None:
             # Legacy same-grid incremental replay: source and target historical
