@@ -1672,6 +1672,23 @@ def run_gpt2_block(
 
     if sparse_attention_indices is not None:
         sparse_attention_indices = expand_sparse_attention_indices(sparse_attention_indices, num_heads)
+        full_key_coverage = sparse_attention_indices.shape[-1] == seq_len
+        if full_key_coverage:
+            expected_indices = torch.arange(
+                seq_len,
+                device=sparse_attention_indices.device,
+                dtype=sparse_attention_indices.dtype,
+            ).view(1, 1, 1, seq_len)
+            full_key_coverage = bool(
+                torch.equal(
+                    torch.sort(sparse_attention_indices, dim=-1).values,
+                    expected_indices.expand_as(sparse_attention_indices),
+                )
+            )
+    else:
+        full_key_coverage = False
+
+    if sparse_attention_indices is not None and not full_key_coverage:
         selected_key = gather_sparse_sequence_vectors(attention_key, sparse_attention_indices)
         selected_value = gather_sparse_sequence_vectors(attention_value, sparse_attention_indices)
         attn_scores = (query.unsqueeze(-2) * selected_key).sum(dim=-1)
@@ -1692,31 +1709,17 @@ def run_gpt2_block(
             attn_weights = F.dropout(attn_weights, p=float(getattr(attn, "attn_pdrop", 0.0)), training=block.training)
         attn_output = (attn_weights.unsqueeze(-1) * selected_value).sum(dim=-2)
     else:
-        # GPT-2's _attn returns probabilities that this replay immediately
-        # discards. Reproduce its scaling/causal semantics through SDPA instead
-        # of materializing the full [B,H,Q,K] matrix.
-        scaling = 1.0
-        if bool(getattr(attn, "scale_attn_weights", True)):
-            scaling /= math.sqrt(head_dim)
-        if bool(getattr(attn, "scale_attn_by_inverse_layer_idx", False)):
-            layer_idx = getattr(attn, "layer_idx", None)
-            if layer_idx is None:
-                raise ValueError("GPT-2 inverse-layer attention scaling requires layer_idx.")
-            scaling /= float(int(layer_idx) + 1)
-        attn_dropout = getattr(attn, "attn_dropout", None)
-        dropout_p = (
-            float(attn_dropout.p)
-            if isinstance(attn_dropout, nn.Dropout)
-            else float(getattr(attn, "attn_pdrop", 0.0))
+        native_attention = (
+            attn._upcast_and_reordered_attn
+            if bool(getattr(attn, "reorder_and_upcast_attn", False))
+            else attn._attn
         )
-        sdpa_query = query * (scaling * math.sqrt(head_dim))
-        attn_output = F.scaled_dot_product_attention(
-            sdpa_query.contiguous(),
-            attention_key.contiguous(),
-            attention_value.contiguous(),
-            attn_mask=None,
-            dropout_p=dropout_p if block.training else 0.0,
-            is_causal=True,
+        attn_output, _ = native_attention(
+            query,
+            attention_key,
+            attention_value,
+            attention_mask=None,
+            head_mask=None,
         )
 
     attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_len, num_heads * head_dim)
