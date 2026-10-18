@@ -221,8 +221,16 @@ def test_replay_interleaves_native_layers_between_translated_target_layers(monke
         del model, token_ids
         return torch.zeros(1, 1, 8)
 
-    def fake_run_gpt2_block(block, hidden_states, *, sparse_attention_indices=None, injected_key=None, injected_value=None):
-        del hidden_states, sparse_attention_indices
+    def fake_run_gpt2_block(
+        block,
+        hidden_states,
+        *,
+        sparse_attention_indices=None,
+        injected_key=None,
+        injected_value=None,
+        attention_backend="gathered",
+    ):
+        del hidden_states, sparse_attention_indices, attention_backend
         call_order.append(("cache" if injected_key is None else "inject", block.layer_idx))
         present = (
             torch.full((1, 2, 1, 4), float(block.layer_idx)),

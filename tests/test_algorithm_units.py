@@ -19,11 +19,13 @@ from alg.mot.train import (
     align_sparse_attention_indices_to_target_tokens,
     align_cache_blocks_to_target_tokens,
     build_cross_token_alignment,
+    build_dense_selected_attention_mask,
     build_replayed_target_past,
     build_causal_attention_mask,
     collect_mot_balance_metrics,
     extract_source_attention_topk_indices,
     translate_layer_window,
+    validate_selected_attention_indices,
     _build_rotary_input_hidden_states,
 )
 from core.common import TokenIDs, extract_receiver_aligned_sharer_past
@@ -61,6 +63,51 @@ class ConstantTranslator(torch.nn.Module):
             self.value,
             dtype=layer_window_cache.dtype,
             device=layer_window_cache.device,
+        )
+
+
+def test_dense_selected_mask_is_permutation_invariant_and_rejects_bad_sets() -> None:
+    indices = torch.tensor(
+        [[[[0, 1, 2], [1, 0, 2], [2, 0, 1], [3, 1, 0]]]],
+        dtype=torch.long,
+    )
+    permuted = indices[..., [2, 0, 1]]
+    kwargs = {
+        "batch_size": 1,
+        "num_heads": 2,
+        "query_len": 4,
+        "key_len": 4,
+        "dtype": torch.float32,
+        "device": torch.device("cpu"),
+    }
+    original_mask = build_dense_selected_attention_mask(indices, **kwargs)
+    permuted_mask = build_dense_selected_attention_mask(permuted, **kwargs)
+    assert torch.equal(original_mask, permuted_mask)
+    assert tuple(original_mask.shape) == (1, 2, 4, 4)
+
+    with pytest.raises(ValueError, match="unique"):
+        validate_selected_attention_indices(
+            torch.tensor([[[[0, 0]]]], dtype=torch.long),
+            batch_size=1,
+            num_heads=1,
+            query_len=1,
+            key_len=4,
+        )
+    with pytest.raises(ValueError, match="in \\[0, 4\\)"):
+        validate_selected_attention_indices(
+            torch.tensor([[[[0, 4]]]], dtype=torch.long),
+            batch_size=1,
+            num_heads=1,
+            query_len=1,
+            key_len=4,
+        )
+    with pytest.raises(ValueError, match="at least one causal key"):
+        validate_selected_attention_indices(
+            torch.tensor([[[[1, 2]]]], dtype=torch.long),
+            batch_size=1,
+            num_heads=1,
+            query_len=1,
+            key_len=4,
         )
 
 

@@ -1,4 +1,4 @@
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 import math
 from pathlib import Path
@@ -31,6 +31,7 @@ from core.topology import get_translator_id
 
 
 MOT_VARIANTS = {"single", "mot"}
+ATTENTION_BACKENDS = {"gathered", "dense_selected"}
 
 
 CHANNEL_ALIGNED_LAYER_ALIGNMENTS = {"terminal", "depth-ratio"}
@@ -76,6 +77,7 @@ class TrainConfig(Config):
     topk_sparse_attn: int
     num_bottom_full_attn: int
     require_identity_token_ledgers: bool
+    attention_backend: str = field(default="gathered", kw_only=True)
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -101,6 +103,10 @@ class TrainConfig(Config):
             raise ValueError("topk_sparse_attn must be >= 1")
         if self.num_bottom_full_attn < 0:
             raise ValueError("num_bottom_full_attn must be >= 0")
+        if self.attention_backend not in ATTENTION_BACKENDS:
+            raise ValueError(
+                f"attention_backend must be one of {sorted(ATTENTION_BACKENDS)}"
+            )
         initialize_train_output_paths(self)
 
 
@@ -1086,6 +1092,7 @@ def build_replayed_target_past(
         tgt_spec=tgt_spec,
         sparse_attention_indices=sparse_attention_indices,
         num_bottom_full_attn=ctx.config.num_bottom_full_attn,
+        attention_backend=getattr(ctx.config, "attention_backend", "gathered"),
         retain_target_prefix_past_key_values=retain_target_prefix_past_key_values,
         retain_target_prefix_injected_window_past_key_values=retain_injected_prefix_past,
     )
@@ -1681,6 +1688,82 @@ def expand_sparse_attention_indices(sparse_attention_indices: torch.Tensor, num_
     )
 
 
+def validate_selected_attention_indices(
+    sparse_attention_indices: torch.Tensor,
+    *,
+    batch_size: int,
+    num_heads: int,
+    query_len: int,
+    key_len: int,
+    query_position_offset: int = 0,
+) -> torch.Tensor:
+    """Validate the unique, in-range, nonempty causal selected-key contract."""
+    if sparse_attention_indices.dtype not in {
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.uint8,
+    }:
+        raise ValueError("Selected attention indices must use an integer dtype.")
+    indices = expand_sparse_attention_indices(sparse_attention_indices, num_heads)
+    expected_prefix = (batch_size, num_heads, query_len)
+    if tuple(indices.shape[:3]) != expected_prefix:
+        raise ValueError(
+            "Selected attention index shape mismatch: "
+            f"expected {expected_prefix} in the first dimensions, got {tuple(indices.shape)}"
+        )
+    indices = indices.to(dtype=torch.long)
+    if bool(((indices < 0) | (indices >= key_len)).any().item()):
+        raise ValueError(f"Selected attention indices must be in [0, {key_len}).")
+    if indices.shape[-1] > 1:
+        ordered = torch.sort(indices, dim=-1).values
+        if bool((ordered[..., 1:] == ordered[..., :-1]).any().item()):
+            raise ValueError("Selected attention indices must be unique per query.")
+    query_positions = torch.arange(
+        query_position_offset,
+        query_position_offset + query_len,
+        device=indices.device,
+    ).view(1, 1, query_len, 1)
+    if not bool((indices <= query_positions).any(dim=-1).all().item()):
+        raise ValueError("Each query must select at least one causal key.")
+    return indices
+
+
+def build_dense_selected_attention_mask(
+    sparse_attention_indices: torch.Tensor,
+    *,
+    batch_size: int,
+    num_heads: int,
+    query_len: int,
+    key_len: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build an additive dense mask for exactly the selected causal key set."""
+    indices = validate_selected_attention_indices(
+        sparse_attention_indices,
+        batch_size=batch_size,
+        num_heads=num_heads,
+        query_len=query_len,
+        key_len=key_len,
+    ).to(device=device)
+    selected = torch.zeros(
+        batch_size,
+        num_heads,
+        query_len,
+        key_len,
+        dtype=torch.bool,
+        device=device,
+    )
+    selected.scatter_(dim=-1, index=indices, value=True)
+    query_positions = torch.arange(query_len, device=device).view(1, 1, query_len, 1)
+    key_positions = torch.arange(key_len, device=device).view(1, 1, 1, key_len)
+    valid = selected & (key_positions <= query_positions)
+    additive = torch.zeros(valid.shape, dtype=dtype, device=device)
+    return additive.masked_fill(~valid, torch.finfo(dtype).min)
+
+
 def gather_sparse_sequence_vectors(sequence: torch.Tensor, sparse_attention_indices: torch.Tensor) -> torch.Tensor:
     batch_size, num_heads, seq_len, head_dim = sequence.shape
     sparse_attention_indices = sparse_attention_indices.to(device=sequence.device, dtype=torch.long).clamp(0, seq_len - 1)
@@ -1760,7 +1843,10 @@ def run_gpt2_block(
     sparse_attention_indices: Optional[torch.Tensor] = None,
     injected_key: Optional[torch.Tensor] = None,
     injected_value: Optional[torch.Tensor] = None,
+    attention_backend: str = "gathered",
 ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    if attention_backend not in ATTENTION_BACKENDS:
+        raise ValueError(f"Unsupported GPT-2 attention backend: {attention_backend}")
     if (injected_key is None) != (injected_value is None):
         raise ValueError("injected_key and injected_value must be provided together.")
     if injected_key is not None and injected_key.shape != injected_value.shape:
@@ -1795,7 +1881,24 @@ def run_gpt2_block(
         )
 
     if sparse_attention_indices is not None:
-        sparse_attention_indices = expand_sparse_attention_indices(sparse_attention_indices, num_heads)
+        if attention_backend == "dense_selected":
+            sparse_attention_indices = validate_selected_attention_indices(
+                sparse_attention_indices,
+                batch_size=batch_size,
+                num_heads=num_heads,
+                query_len=seq_len,
+                key_len=seq_len,
+            )
+        else:
+            # Preserve the historical gathered backend for existing heterogeneous
+            # token-alignment users.  Its out-of-range sentinel is part of that
+            # backend's duplicate-masking representation; dense_selected has the
+            # stricter set contract above.
+            sparse_attention_indices = expand_sparse_attention_indices(
+                sparse_attention_indices,
+                num_heads,
+            )
+        sparse_attention_indices = sparse_attention_indices.to(device=attention_key.device)
         full_key_coverage = sparse_attention_indices.shape[-1] == seq_len
         if full_key_coverage:
             expected_indices = torch.arange(
@@ -1812,7 +1915,11 @@ def run_gpt2_block(
     else:
         full_key_coverage = False
 
-    if sparse_attention_indices is not None and not full_key_coverage:
+    if (
+        sparse_attention_indices is not None
+        and not full_key_coverage
+        and attention_backend == "gathered"
+    ):
         selected_key = gather_sparse_sequence_vectors(attention_key, sparse_attention_indices)
         selected_value = gather_sparse_sequence_vectors(attention_value, sparse_attention_indices)
         attn_scores = (query.unsqueeze(-2) * selected_key).sum(dim=-1)
@@ -1838,11 +1945,22 @@ def run_gpt2_block(
             if bool(getattr(attn, "reorder_and_upcast_attn", False))
             else attn._attn
         )
+        attention_mask = None
+        if sparse_attention_indices is not None and not full_key_coverage:
+            attention_mask = build_dense_selected_attention_mask(
+                sparse_attention_indices,
+                batch_size=batch_size,
+                num_heads=num_heads,
+                query_len=seq_len,
+                key_len=seq_len,
+                dtype=query.dtype,
+                device=query.device,
+            )
         attn_output, _ = native_attention(
             query,
             attention_key,
             attention_value,
-            attention_mask=None,
+            attention_mask=attention_mask,
             head_mask=None,
         )
 
@@ -2381,6 +2499,7 @@ def replay_target_prefill_with_injected_window(
     target_model_id: Optional[str] = None,
     sparse_attention_indices: Optional[List[torch.Tensor]] = None,
     num_bottom_full_attn: int = 3,
+    attention_backend: str = "gathered",
     cache_injected_window: bool = False,
     # Retain-only option: resident target KV prefix. When provided, only the
     # delta tokens are replayed while attending to this prefix at every layer.
@@ -2464,9 +2583,12 @@ def replay_target_prefill_with_injected_window(
                 sparse_attention_indices=sparse_attention_indices,
                 injected_key=injected_key,
                 injected_value=injected_value,
+                attention_backend=attention_backend,
             )
 
     elif model_family == "opt":
+        if attention_backend != "gathered":
+            raise ValueError("dense_selected attention is supported only for GPT-2.")
         decoder = require_opt_decoder(target_model)
         target_blocks = decoder.layers
 
@@ -2497,6 +2619,8 @@ def replay_target_prefill_with_injected_window(
             )
 
     elif model_family == "qwen2":
+        if attention_backend != "gathered":
+            raise ValueError("dense_selected attention is supported only for GPT-2.")
         qwen_model = require_qwen2_model(target_model)
         target_blocks = qwen_model.layers
 
@@ -2531,6 +2655,8 @@ def replay_target_prefill_with_injected_window(
             )
 
     elif model_family == "llama":
+        if attention_backend != "gathered":
+            raise ValueError("dense_selected attention is supported only for GPT-2.")
         llama_model = require_llama_model(target_model)
         target_blocks = llama_model.layers
 
@@ -2565,6 +2691,8 @@ def replay_target_prefill_with_injected_window(
             )
 
     elif model_family == "gemma3":
+        if attention_backend != "gathered":
+            raise ValueError("dense_selected attention is supported only for GPT-2.")
         gemma_model = require_gemma3_model(target_model)
         target_blocks = gemma_model.layers
 

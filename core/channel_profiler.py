@@ -745,6 +745,7 @@ class ChannelProfiler:
             injected_value_block=translated_value,
             tgt_spec=tgt_spec,
             target_model_id=self.node_map[edge.tgt_id].model_id,
+            attention_backend=getattr(self.config, "attention_backend", "gathered"),
         )
         return compute_prefix_correction_and_suffix_lm_loss(
             target_model=target_model,
@@ -802,6 +803,7 @@ class ChannelProfiler:
             injected_value_block=translated_value,
             tgt_spec=tgt_spec,
             target_model_id=self.node_map[edge.tgt_id].model_id,
+            attention_backend=getattr(self.config, "attention_backend", "gathered"),
         )
         return compute_prefix_correction_and_suffix_lm_loss(
             target_model=target_model,

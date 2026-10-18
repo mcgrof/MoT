@@ -29,5 +29,6 @@
   "mot_top_k": 2,
   "topk_sparse_attn": 32,
   "num_bottom_full_attn": 0,
+  "attention_backend": "gathered",
   "require_identity_token_ledgers": false
 }
