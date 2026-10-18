@@ -1675,6 +1675,13 @@ def run_gpt2_block(
         selected_key = gather_sparse_sequence_vectors(attention_key, sparse_attention_indices)
         selected_value = gather_sparse_sequence_vectors(attention_value, sparse_attention_indices)
         attn_scores = (query.unsqueeze(-2) * selected_key).sum(dim=-1)
+        if bool(getattr(attn, "scale_attn_weights", True)):
+            attn_scores = attn_scores / math.sqrt(head_dim)
+        if bool(getattr(attn, "scale_attn_by_inverse_layer_idx", False)):
+            layer_idx = getattr(attn, "layer_idx", None)
+            if layer_idx is None:
+                raise ValueError("GPT-2 inverse-layer attention scaling requires layer_idx.")
+            attn_scores = attn_scores / float(int(layer_idx) + 1)
         invalid_mask = build_sparse_query_mask(sparse_attention_indices, seq_len=seq_len, num_heads=num_heads)
         attn_scores = attn_scores.masked_fill(invalid_mask, torch.finfo(attn_scores.dtype).min)
         attn_weights = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(query.dtype)
