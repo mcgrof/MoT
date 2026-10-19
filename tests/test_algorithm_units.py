@@ -818,6 +818,62 @@ def test_mot_retain_replay_uses_translated_prefix_only_at_injected_layers(monkey
     assert seen[1] == (layer1, 99.0, 98.0)
 
 
+def test_mot_replay_without_injection_recomputes_every_layer(monkeypatch) -> None:
+    import alg.mot.train as mot_train
+
+    target_model = SimpleNamespace(id="same")
+    context_ids = TokenIDs(torch.tensor([[10, 11]], dtype=torch.long), model_id="same")
+    tgt_spec = ModelSpec(
+        model_id="same", num_layers=2, hidden_size=2, num_heads=1, head_dim=2
+    )
+    layer0, layer1 = object(), object()
+    seen = []
+
+    monkeypatch.setattr(
+        mot_train, "resolve_target_model_family", lambda *args, **kwargs: "gpt2"
+    )
+    monkeypatch.setattr(
+        mot_train,
+        "require_gpt2_transformer",
+        lambda _model: SimpleNamespace(h=[layer0, layer1]),
+    )
+    monkeypatch.setattr(
+        mot_train,
+        "build_gpt2_input_hidden_states",
+        lambda _model, _tokens: torch.zeros(1, 2, 2),
+    )
+
+    def fake_run(block, hidden_states, **kwargs):
+        seen.append(
+            (
+                block,
+                kwargs["injected_key"],
+                kwargs["injected_value"],
+            )
+        )
+        present = (
+            torch.zeros(1, 1, 2, 2),
+            torch.zeros(1, 1, 2, 2),
+        )
+        return hidden_states, present
+
+    monkeypatch.setattr(mot_train, "run_gpt2_block", fake_run)
+
+    replayed = mot_train.replay_target_prefill_with_injected_window(
+        target_model=target_model,
+        context_token_ids=context_ids,
+        target_layer_indices=[],
+        injected_key_block=None,
+        injected_value_block=None,
+        tgt_spec=tgt_spec,
+        sparse_attention_indices=None,
+        num_bottom_full_attn=0,
+    )
+
+    assert len(replayed) == 2
+    assert seen == [(layer0, None, None), (layer1, None, None)]
+
+
 def test_mot_retain_cross_append_aligns_full_history_but_replays_only_target_delta(monkeypatch) -> None:
     import alg.mot.train as mot_train
 

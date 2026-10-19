@@ -897,6 +897,10 @@ def build_replayed_target_past(
     # Source-grid token count represented by the resident target prefix. This is
     # distinct from the target prefix length under heterogeneous tokenization.
     retain_source_prefix_tokens: Optional[int] = None,
+    # Diagnostic-only option: reuse a caller-owned selection ledger instead of
+    # executing the source attention-selection forward again.  The caller is
+    # responsible for deriving this ledger from the matching source context.
+    sparse_attention_indices_override: Optional[List[torch.Tensor]] = None,
 ) -> Tuple[PastKeyValues, PastKeyValues]:
     edge_id = f"{src_node_id}_to_{tgt_node_id}"
     node_model_ids = {node.id: node.model_id for node in ctx.nodes}
@@ -948,16 +952,39 @@ def build_replayed_target_past(
                 f"delta_tokens={int(target_context_token_ids.shape[1])}"
             )
 
-    sparse_attention_indices = build_extrapolated_sparse_attention_indices(
-        source_model,
-        sparse_context_token_ids,
-        source_layer_indices=ctx.cm.get_src_layer_indices(edge_id),
-        target_layer_indices=ctx.cm.get_tgt_layer_indices(edge_id),
-        num_source_layers=src_spec.num_layers,
-        num_target_layers=tgt_spec.num_layers,
-        source_model_id=node_model_ids.get(src_node_id),
-        top_k=ctx.config.topk_sparse_attn,
-    )
+    if sparse_attention_indices_override is None:
+        sparse_attention_indices = build_extrapolated_sparse_attention_indices(
+            source_model,
+            sparse_context_token_ids,
+            source_layer_indices=ctx.cm.get_src_layer_indices(edge_id),
+            target_layer_indices=ctx.cm.get_tgt_layer_indices(edge_id),
+            num_source_layers=src_spec.num_layers,
+            num_target_layers=tgt_spec.num_layers,
+            source_model_id=node_model_ids.get(src_node_id),
+            top_k=ctx.config.topk_sparse_attn,
+        )
+    else:
+        if any(
+            value is not None
+            for value in (
+                retain_source_full_context_token_ids,
+                retain_source_full_past_key_values,
+                retain_target_prefix_past_key_values,
+                retain_target_full_context_token_ids,
+                retain_source_prefix_tokens,
+            )
+        ):
+            raise ValueError(
+                "A sparse_attention_indices_override is supported only for a "
+                "complete, non-Retain diagnostic replay."
+            )
+        if len(sparse_attention_indices_override) != tgt_spec.num_layers:
+            raise ValueError(
+                "Selection-ledger layer count mismatch: "
+                f"selected_layers={len(sparse_attention_indices_override)} "
+                f"target_layers={tgt_spec.num_layers}"
+            )
+        sparse_attention_indices = sparse_attention_indices_override
     needs_token_alignment = not token_ledgers_have_identity_alignment(
         source_model,
         target_model,
@@ -2493,8 +2520,8 @@ def replay_target_prefill_with_injected_window(
     target_model: Model,
     context_token_ids: TokenIDs,
     target_layer_indices: List[int],
-    injected_key_block: torch.Tensor,
-    injected_value_block: torch.Tensor,
+    injected_key_block: Optional[torch.Tensor],
+    injected_value_block: Optional[torch.Tensor],
     tgt_spec: ModelSpec,
     target_model_id: Optional[str] = None,
     sparse_attention_indices: Optional[List[torch.Tensor]] = None,
@@ -2509,12 +2536,19 @@ def replay_target_prefill_with_injected_window(
     retain_target_prefix_injected_window_past_key_values: Optional[PastKeyValues] = None,
 ) -> PastKeyValues:
     ensure_token_ids_model(target_model, context_token_ids)
-    injected_window = blocks_to_partial_past_key_values(
-        key_block=injected_key_block,
-        value_block=injected_value_block,
-        num_heads=tgt_spec.num_key_value_heads,
-        head_dim=tgt_spec.head_dim,
-    )
+    if (injected_key_block is None) != (injected_value_block is None):
+        raise ValueError("Injected key and value blocks must both be present or absent.")
+    if injected_key_block is None:
+        if target_layer_indices:
+            raise ValueError("Target injection layers require injected key/value blocks.")
+        injected_window: PastKeyValues = tuple()
+    else:
+        injected_window = blocks_to_partial_past_key_values(
+            key_block=injected_key_block,
+            value_block=injected_value_block,
+            num_heads=tgt_spec.num_key_value_heads,
+            head_dim=tgt_spec.head_dim,
+        )
     translated_num_layers = len(injected_window)
 
     # zip(target_layer_indices, injected_window) would silently truncate on mismatch,
@@ -2729,7 +2763,9 @@ def replay_target_prefill_with_injected_window(
         raise ValueError(f"Unsupported replay target model family: {model_family}")
 
     rebuilt_past: List[Tuple[torch.Tensor, torch.Tensor]] = []
-    target_start_layer_idx = target_layer_indices[0]
+    target_start_layer_idx = (
+        target_layer_indices[0] if target_layer_indices else len(target_blocks)
+    )
     layer_sparse_attention_indices = sparse_attention_indices if sparse_attention_indices is not None else [None] * tgt_spec.num_layers
 
     def native_sparse_attention_for_layer(layer_idx: int) -> Optional[torch.Tensor]:
